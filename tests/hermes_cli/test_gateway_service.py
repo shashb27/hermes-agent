@@ -1381,7 +1381,10 @@ class TestEnsureUserSystemdEnv:
     def test_sets_xdg_runtime_dir_when_missing(self, tmp_path, monkeypatch):
         monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        monkeypatch.setattr(os, "getuid", lambda: 42)
+        # ``os.getuid`` is absent on Windows; ``raising=False`` creates the
+        # stub instead of erroring at setup so this systemd helper test can be
+        # collected cross-platform.
+        monkeypatch.setattr(os, "getuid", lambda: 42, raising=False)
 
         # Patch Path.exists so /run/user/42 appears to exist.
         # Using a FakePath subclass breaks on Python 3.12+ where
@@ -1404,7 +1407,8 @@ class TestEnsureUserSystemdEnv:
 
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        monkeypatch.setattr(os, "getuid", lambda: 99)
+        # ``raising=False``: ``os.getuid`` doesn't exist on Windows.
+        monkeypatch.setattr(os, "getuid", lambda: 99, raising=False)
 
         gateway_cli._ensure_user_systemd_env()
 
@@ -1426,7 +1430,8 @@ class TestEnsureUserSystemdEnv:
 
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        monkeypatch.setattr(os, "getuid", lambda: 99)
+        # ``raising=False``: ``os.getuid`` doesn't exist on Windows.
+        monkeypatch.setattr(os, "getuid", lambda: 99, raising=False)
 
         gateway_cli._ensure_user_systemd_env()
 

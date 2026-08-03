@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -283,6 +284,44 @@ def _append_unique_pid(pids: list[int], pid: int | None, exclude_pids: set[int])
     pids.append(pid)
 
 
+_GATEWAY_RUN_RE = re.compile(r"(?:^|[\s/\\])gateway\s+run(?:\s|$)")
+# Entry-point markers that identify a Hermes CLI invocation.  A command only
+# counts as a gateway when it pairs one of these with the ``gateway run``
+# subcommand (see ``_is_gateway_run_command``).  ``gateway/run.py`` is handled
+# separately because it is the run module itself and needs no subcommand.
+_HERMES_CLI_MARKERS = (
+    "hermes_cli.main",
+    "hermes_cli/main.py",
+    "hermes",
+)
+
+
+def _is_gateway_run_command(command: str) -> bool:
+    """Return True when ``command`` is an actual ``gateway run`` process.
+
+    The previous implementation matched broad substrings such as
+    ``"hermes gateway"`` and ``"hermes_cli.main --profile"``.  Those matched
+    *any* gateway subcommand (``status``, ``install``, ``stop``) and even
+    unrelated ``--profile`` CLI invocations, which meant a transient
+    ``hermes gateway status`` could be counted as a running gateway while the
+    real long-lived ``gateway run`` process was harder to isolate.  On Windows,
+    where the ancestor-chain exclusion is skipped (see ``_scan_gateway_pids``),
+    that broadness could report the wrong process entirely.
+
+    Matching requires either the direct run module (``gateway/run.py``) or a
+    Hermes CLI entry-point marker paired with the ``gateway run`` subcommand.
+    Backslashes are normalised so Windows-style paths match the same way.
+    """
+    if not command:
+        return False
+    normalized = command.replace("\\", "/")
+    if "gateway/run.py" in normalized:
+        return True
+    if not any(marker in normalized for marker in _HERMES_CLI_MARKERS):
+        return False
+    return bool(_GATEWAY_RUN_RE.search(normalized))
+
+
 def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> list[int]:
     """Best-effort process-table scan for gateway PIDs.
 
@@ -293,18 +332,17 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
     # Exclude the entire ancestor chain so the CLI process that invoked this
     # scan (e.g. ``hermes gateway status``) is never mistaken for a running
     # gateway.  See #13242.
-    exclude_pids = exclude_pids | _get_ancestor_pids()
+    #
+    # POSIX only: on Windows we rely on the strict ``gateway run`` match in
+    # ``_is_gateway_run_command`` instead.  The broad ancestor walk there is
+    # both unnecessary (a transient ``gateway status`` no longer matches) and
+    # risky — a legitimately-matched ``gateway run`` that happens to sit in the
+    # CLI's ancestor chain (e.g. a foreground run that shelled out to
+    # ``gateway status``) would be wrongly excluded, hiding a live gateway.
+    # ``_append_unique_pid`` still drops our own PID on every platform.
+    if not is_windows():
+        exclude_pids = exclude_pids | _get_ancestor_pids()
     pids: list[int] = []
-    patterns = [
-        "hermes_cli.main gateway",
-        "hermes_cli.main --profile",
-        "hermes_cli.main -p",
-        "hermes_cli/main.py gateway",
-        "hermes_cli/main.py --profile",
-        "hermes_cli/main.py -p",
-        "hermes gateway",
-        "gateway/run.py",
-    ]
     current_home = str(get_hermes_home().resolve())
     current_profile_arg = _profile_arg(current_home)
     current_profile_name = current_profile_arg.split()[-1] if current_profile_arg else ""
@@ -385,7 +423,7 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
                     current_cmd = line[len("CommandLine="):]
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId="):]
-                    if any(p in current_cmd for p in patterns) and (
+                    if _is_gateway_run_command(current_cmd) and (
                         all_profiles or _matches_current_profile(current_cmd)
                     ):
                         try:
@@ -409,7 +447,7 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
                         try:
                             cmdline = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", errors="replace")
                             cmdline = cmdline.replace("\x00", " ")
-                            if any(p in cmdline for p in patterns) and (
+                            if _is_gateway_run_command(cmdline) and (
                                 all_profiles or _matches_current_profile(cmdline)
                             ):
                                 _append_unique_pid(pids, pid, exclude_pids)
@@ -452,7 +490,7 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
 
                     if pid is None:
                         continue
-                    if any(pattern in command for pattern in patterns) and (
+                    if _is_gateway_run_command(command) and (
                         all_profiles or _matches_current_profile(command)
                     ):
                         _append_unique_pid(pids, pid, exclude_pids)
@@ -967,6 +1005,52 @@ def _probe_launchd_service_running() -> bool:
     return result.returncode == 0
 
 
+def _windows_gateway_runtime_snapshot(gateway_pids: tuple[int, ...]) -> GatewayRuntimeSnapshot:
+    """Build a runtime snapshot for the Windows Scheduled Task backend.
+
+    Mirrors the systemd/launchd branches instead of letting Windows fall
+    through to ``manual process``.  Reports the manager as ``windows scheduled
+    task`` (or the Startup-folder fallback) and derives ``service_running``
+    from the Scheduled Task's live run state, so ``hermes status --all`` and
+    ``hermes gateway status`` reflect a task-managed gateway accurately
+    (issue #25502).
+    """
+    manager = "manual process"
+    service_installed = False
+    service_running = False
+    service_scope: str | None = None
+    try:
+        from hermes_cli import gateway_windows
+
+        if gateway_windows.is_task_registered():
+            manager = "windows scheduled task"
+            service_scope = "scheduled task"
+            service_installed = True
+            # schtasks reports "Running" while the task action (and the child
+            # gateway process it launches) is executing.  Locales may localise
+            # the value or schtasks may be unavailable, so also treat a live
+            # gateway process as "running" — never report "stopped" while a
+            # gateway is actually up.
+            raw_status = gateway_windows.query_task_status().get("status", "").strip().lower()
+            service_running = raw_status == "running" or bool(gateway_pids)
+        elif gateway_windows.is_startup_entry_installed():
+            manager = "windows startup item"
+            service_scope = "startup item"
+            service_installed = True
+            service_running = bool(gateway_pids)
+    except Exception:
+        # Degrade gracefully to the process-only view rather than crashing the
+        # status command if probing the Windows backend fails.
+        pass
+    return GatewayRuntimeSnapshot(
+        manager=manager,
+        service_installed=service_installed,
+        service_running=service_running,
+        gateway_pids=gateway_pids,
+        service_scope=service_scope,
+    )
+
+
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
     """Return a unified view of gateway liveness for the current profile."""
     gateway_pids = tuple(find_gateway_pids())
@@ -1003,6 +1087,9 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
             gateway_pids=gateway_pids,
             service_scope="launchd",
         )
+
+    if is_windows():
+        return _windows_gateway_runtime_snapshot(gateway_pids)
 
     return GatewayRuntimeSnapshot(
         manager="manual process",
